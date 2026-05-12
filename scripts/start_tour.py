@@ -60,13 +60,63 @@ def _can_import(name: str) -> bool:
         return False
 
 
+def _pip_command() -> tuple[list[str], list[str]]:
+    """Return ``(prefix, python_args)`` for the best pip invocation.
+
+    Prefer ``uv pip`` when uv is on PATH (uv-managed venvs may have pip
+    disabled).  When using uv, also bind ``--python _PYTHON`` so packages land
+    in the same interpreter that's running this script — without it ``uv pip``
+    falls back to its own venv discovery (``$VIRTUAL_ENV`` / ``./.venv``) and
+    may install into a different environment.
+
+    Falls back to ``python -m pip`` (with no extra args) when uv is absent.
+    """
+    uv = shutil.which("uv")
+    if uv:
+        return ["uv", "pip"], ["--python", _PYTHON]
+    return [_PYTHON, "-m", "pip"], []
+
+
+_PIP_CMD, _PIP_PYTHON_ARGS = _pip_command()
+
+
+def _pip_install(
+    *pkgs: str,
+    requirements_file: str | None = None,
+    editable: bool = False,
+    extra_flags: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    """Run the best-available pip install.
+
+    Prefers ``uv pip install`` when ``uv`` is on PATH; falls back to
+    ``python -m pip install`` for environments where uv is unavailable
+    or blocked (e.g. some locked CI runners).
+    """
+    if requirements_file is not None:
+        parts = [*_PIP_CMD, "install", "-r", requirements_file]
+    elif editable:
+        parts = [*_PIP_CMD, "install", "-e", ".", *extra_flags]
+    else:
+        parts = [*_PIP_CMD, "install", *pkgs, *extra_flags]
+
+    return subprocess.run(parts, capture_output=True, text=True, errors="replace")
+
+
+def _pip_install_quiet(*pkgs: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*_PIP_CMD, "install", "-q", *pkgs, *_PIP_PYTHON_ARGS],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+
+
 def _bootstrap() -> None:
-    missing = [pip for imp, pip in _BOOTSTRAP_PACKAGES if not _can_import(imp)]
+    missing = [pkg for imp, pkg in _BOOTSTRAP_PACKAGES if not _can_import(imp)]
     if not missing:
         return
     print(f"  Installing bootstrap dependencies: {', '.join(missing)} ...")
-    cmd = ["uv", "pip", "install", *missing, "-q"]
-    result = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    result = _pip_install_quiet(*missing)
     if result.returncode != 0:
         if result.stdout:
             sys.stderr.write(result.stdout)
@@ -75,7 +125,7 @@ def _bootstrap() -> None:
         sys.stderr.write(
             f"\n  Failed to install bootstrap dependencies: {', '.join(missing)}\n"
             f"  Try running it manually to inspect the full error:\n"
-            f"    {' '.join(cmd)}\n"
+            f"    {' '.join(_PIP_CMD + ['install'] + missing)}\n"
         )
         raise SystemExit(1)
 
@@ -615,28 +665,6 @@ def _ensure_math_animator_system_deps() -> None:
         log_warn("Math animator may fail until these are installed: " + " | ".join(commands))
 
 
-def _install_commands(
-    profile: str,
-    catalog: dict[str, Any],
-    *,
-    include_math_animator: bool = False,
-) -> list[tuple[list[str], Path]]:
-    profile = PROFILE_ALIASES.get(profile, profile)
-    if profile not in PROFILE_COMMANDS:
-        raise ValueError(f"Unknown install profile: {profile}")
-
-    cmds: list[tuple[list[str], Path]] = []
-    for req in PROFILE_COMMANDS[profile]:
-        cmds.append((["uv", "pip", "install", "-r", req], PROJECT_ROOT))
-    if include_math_animator:
-        cmds.append((["uv", "pip", "install", "-r", MATH_ANIMATOR_REQUIREMENTS], PROJECT_ROOT))
-    cmds.append((["uv", "pip", "install", "-e", ".", "--no-deps"], PROJECT_ROOT))
-    if profile.startswith("web"):
-        npm_cmd = _get_npm_command()
-        cmds.append(([npm_cmd, "install"], PROJECT_ROOT / "web"))
-    return cmds
-
-
 def _run_cmd(cmd: list[str], cwd: Path) -> None:
     log_info(f"{dim(str(cwd))}  {' '.join(cmd)}")
     use_shell = platform.system().lower() == "windows"
@@ -1091,6 +1119,76 @@ def _run_live(cmd: list[str], cwd: Path, label: str) -> None:
     print()
     if result.returncode != 0:
         raise RuntimeError(f"Command failed (exit {result.returncode}): {' '.join(cmd)}")
+
+
+def _install_profile_options() -> list[tuple[str, str, str]]:
+    return [
+        (
+            "web-basic",
+            _t("install_profile_web_label"),
+            _t("install_profile_web_desc"),
+        ),
+        (
+            "web-tutorbot",
+            _t("install_profile_tutorbot_label"),
+            _t("install_profile_tutorbot_desc"),
+        ),
+        (
+            "web-matrix",
+            _t("install_profile_matrix_label"),
+            _t("install_profile_matrix_desc"),
+        ),
+    ]
+
+
+def _install_profile_label(profile: str) -> str:
+    for value, label, _desc in _install_profile_options():
+        if value == profile:
+            return label
+    return profile
+
+
+def _select_install_profile() -> str:
+    profile = select(_t("install_profile_prompt"), _install_profile_options())
+    log_info(_t("install_selected", profile=_install_profile_label(profile)))
+    return profile
+
+
+def _install_commands(
+    profile: str,
+    catalog: dict[str, Any],
+    *,
+    include_math_animator: bool = False,
+) -> list[tuple[list[str], Path]]:
+    del catalog
+    profile = PROFILE_ALIASES.get(profile, profile)
+    if profile not in PROFILE_COMMANDS:
+        raise ValueError(f"Unknown install profile: {profile}")
+
+    cmds: list[tuple[list[str], Path]] = []
+    for req in PROFILE_COMMANDS[profile]:
+        cmds.append(([*_PIP_CMD, "install", "-r", req, *_PIP_PYTHON_ARGS], PROJECT_ROOT))
+    if include_math_animator:
+        cmds.append(
+            (
+                [*_PIP_CMD, "install", "-r", MATH_ANIMATOR_REQUIREMENTS, *_PIP_PYTHON_ARGS],
+                PROJECT_ROOT,
+            )
+        )
+    cmds.append(([*_PIP_CMD, "install", "-e", ".", "--no-deps", *_PIP_PYTHON_ARGS], PROJECT_ROOT))
+    if profile.startswith("web"):
+        cmds.append(([_get_npm_command(), "install"], PROJECT_ROOT / "web"))
+    return cmds
+
+
+def _requirements_for_install(profile: str, *, include_math_animator: bool = False) -> list[str]:
+    profile = PROFILE_ALIASES.get(profile, profile)
+    if profile not in PROFILE_COMMANDS:
+        raise ValueError(f"Unknown install profile: {profile}")
+    requirements = list(PROFILE_COMMANDS[profile])
+    if include_math_animator:
+        requirements.append(MATH_ANIMATOR_REQUIREMENTS)
+    return requirements
 
 
 def _install_dependencies() -> None:
